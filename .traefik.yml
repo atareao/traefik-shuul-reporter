@@ -1,0 +1,8 @@
+displayName: "shuul Reporter"
+type: middleware
+import: github.com/atareao/traefik-shuul-reporter
+summary: "Reports backend HTTP response status codes to shuul for intelligent rate limiting."
+testData:
+  ShuulUrl: "http://shuul:3000/api/v1/report"
+  TimeoutMs: 500
+  ReportClientIP: true
