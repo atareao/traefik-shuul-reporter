@@ -1,4 +1,4 @@
-// Package main implements a Traefik middleware plugin that captures
+// Package traefik_shuul_reporter implements a Traefik middleware plugin that captures
 // backend HTTP response status codes and reports them to shuul
 // for fail2ban-style rate limiting based on response codes.
 //
@@ -11,7 +11,7 @@
 // The plugin wraps the http.ResponseWriter to intercept the status code
 // sent by the backend, then asynchronously POSTs the IP, status code,
 // path, and method to shuul's report endpoint for evaluation.
-package main
+package traefik_shuul_reporter
 
 import (
 	"bytes"
