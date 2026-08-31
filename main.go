@@ -17,7 +17,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -50,7 +50,7 @@ type ReportPayload struct {
 // captureWriter wraps http.ResponseWriter to intercept the status code.
 type captureWriter struct {
 	http.ResponseWriter
-	statusCode int
+	statusCode  int
 	wroteHeader bool
 }
 
@@ -77,16 +77,22 @@ type ShuulPlugin struct {
 	name   string
 	config *Config
 	client *http.Client
+	logger *log.Logger
 }
 
 // New creates a new plugin instance.
 func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
+	logger := log.New(log.Writer(), "traefik-shuul-reporter: ", log.LstdFlags|log.Lmsgprefix)
+
 	if config.ShuulUrl == "" {
 		config.ShuulUrl = "http://shuul:3000/api/v1/report"
 	}
 	if config.TimeoutMs <= 0 {
 		config.TimeoutMs = 500
 	}
+
+	logger.Printf("plugin loaded | shuul_url=%s timeout_ms=%d report_client_ip=%v",
+		config.ShuulUrl, config.TimeoutMs, config.ReportClientIP)
 
 	client := &http.Client{
 		Timeout: time.Duration(config.TimeoutMs) * time.Millisecond,
@@ -97,26 +103,24 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		name:   name,
 		config: config,
 		client: client,
+		logger: logger,
 	}, nil
 }
 
 // ServeHTTP implements the http.Handler interface.
-// It wraps the ResponseWriter, delegates to the next handler (the backend),
-// then asynchronously reports the captured status code to shuul.
 func (p *ShuulPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	cw := &captureWriter{ResponseWriter: rw}
 	p.next.ServeHTTP(cw, req)
 
-	// Only report if we captured a status code and it's not a success
-	// (2xx responses are not interesting for rate limiting).
+	// Only report non-2xx status codes
 	if cw.statusCode == 0 || (cw.statusCode >= 200 && cw.statusCode < 300) {
+		p.logger.Printf("skip: status=%d method=%s path=%s",
+			cw.statusCode, req.Method, req.URL.Path)
 		return
 	}
 
-	// Extract the client IP
 	ip := extractClientIP(req, p.config.ReportClientIP)
 
-	// Build and send the report asynchronously
 	payload := ReportPayload{
 		IpAddress:  ip,
 		StatusCode: cw.statusCode,
@@ -124,12 +128,13 @@ func (p *ShuulPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		Method:     req.Method,
 	}
 
+	p.logger.Printf("report: status=%d ip=%s method=%s path=%s",
+		cw.statusCode, ip, req.Method, req.URL.Path)
+
 	go p.sendReport(payload)
 }
 
 // extractClientIP extracts the original client IP from the request.
-// If ReportClientIP is true, it checks X-Forwarded-For first (set by Traefik),
-// otherwise falls back to RemoteAddr.
 func extractClientIP(r *http.Request, useForwardedFor bool) string {
 	if useForwardedFor {
 		if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
@@ -138,7 +143,6 @@ func extractClientIP(r *http.Request, useForwardedFor bool) string {
 			}
 		}
 	}
-	// Remove port from RemoteAddr
 	addr := r.RemoteAddr
 	if idx := strings.LastIndex(addr, ":"); idx != -1 {
 		return addr[:idx]
@@ -147,10 +151,10 @@ func extractClientIP(r *http.Request, useForwardedFor bool) string {
 }
 
 // sendReport POSTs the report payload to shuul in the background.
-// Errors are silently ignored (fire-and-forget).
 func (p *ShuulPlugin) sendReport(payload ReportPayload) {
 	data, err := json.Marshal(payload)
 	if err != nil {
+		p.logger.Printf("send_report: json marshal error: %v", err)
 		return
 	}
 
@@ -160,9 +164,18 @@ func (p *ShuulPlugin) sendReport(payload ReportPayload) {
 		bytes.NewReader(data),
 	)
 	if err != nil {
+		p.logger.Printf("send_report: http error: %v", err)
 		return
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		p.logger.Printf("send_report: unexpected response from shuul: status=%d", resp.StatusCode)
+		return
+	}
+
+	p.logger.Printf("send_report: ok status=%d ip=%s shuul_response=%d",
+		payload.StatusCode, payload.IpAddress, resp.StatusCode)
 }
 
 // CreateConfig creates the default plugin configuration.
@@ -174,7 +187,4 @@ func CreateConfig() *Config {
 	}
 }
 
-// Ensure main exists for `go build` compatibility with Traefik's plugin loader.
-func main() {
-	fmt.Println("traefik-shuul-reporter: plugin loaded")
-}
+func main() {}
