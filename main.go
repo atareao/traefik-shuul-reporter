@@ -167,5 +167,3 @@ func CreateConfig() *Config {
 		ReportClientIP: true,
 	}
 }
-
-func main() {}

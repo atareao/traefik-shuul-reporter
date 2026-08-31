@@ -1,5 +1,6 @@
 # Binaries
 shuul-reporter
+plugin
 *.exe
 *.so
 *.dylib
