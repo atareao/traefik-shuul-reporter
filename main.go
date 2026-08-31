@@ -17,7 +17,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"log"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -77,13 +77,10 @@ type ShuulPlugin struct {
 	name   string
 	config *Config
 	client *http.Client
-	logger *log.Logger
 }
 
 // New creates a new plugin instance.
 func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
-	logger := log.New(log.Writer(), "traefik-shuul-reporter: ", log.LstdFlags|log.Lmsgprefix)
-
 	if config.ShuulUrl == "" {
 		config.ShuulUrl = "http://shuul:3000/api/v1/report"
 	}
@@ -91,7 +88,7 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		config.TimeoutMs = 500
 	}
 
-	logger.Printf("plugin loaded | shuul_url=%s timeout_ms=%d report_client_ip=%v",
+	fmt.Printf("traefik-shuul-reporter: plugin loaded | shuul_url=%s timeout_ms=%d report_client_ip=%v\n",
 		config.ShuulUrl, config.TimeoutMs, config.ReportClientIP)
 
 	client := &http.Client{
@@ -103,7 +100,6 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		name:   name,
 		config: config,
 		client: client,
-		logger: logger,
 	}, nil
 }
 
@@ -114,8 +110,6 @@ func (p *ShuulPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 	// Only report non-2xx status codes
 	if cw.statusCode == 0 || (cw.statusCode >= 200 && cw.statusCode < 300) {
-		p.logger.Printf("skip: status=%d method=%s path=%s",
-			cw.statusCode, req.Method, req.URL.Path)
 		return
 	}
 
@@ -127,9 +121,6 @@ func (p *ShuulPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		Path:       req.URL.Path,
 		Method:     req.Method,
 	}
-
-	p.logger.Printf("report: status=%d ip=%s method=%s path=%s",
-		cw.statusCode, ip, req.Method, req.URL.Path)
 
 	go p.sendReport(payload)
 }
@@ -154,7 +145,6 @@ func extractClientIP(r *http.Request, useForwardedFor bool) string {
 func (p *ShuulPlugin) sendReport(payload ReportPayload) {
 	data, err := json.Marshal(payload)
 	if err != nil {
-		p.logger.Printf("send_report: json marshal error: %v", err)
 		return
 	}
 
@@ -164,18 +154,9 @@ func (p *ShuulPlugin) sendReport(payload ReportPayload) {
 		bytes.NewReader(data),
 	)
 	if err != nil {
-		p.logger.Printf("send_report: http error: %v", err)
 		return
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		p.logger.Printf("send_report: unexpected response from shuul: status=%d", resp.StatusCode)
-		return
-	}
-
-	p.logger.Printf("send_report: ok status=%d ip=%s shuul_response=%d",
-		payload.StatusCode, payload.IpAddress, resp.StatusCode)
+	resp.Body.Close()
 }
 
 // CreateConfig creates the default plugin configuration.
