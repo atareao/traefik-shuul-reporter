@@ -41,10 +41,18 @@ type Config struct {
 
 // ReportPayload is the JSON structure POSTed to shuul's /api/v1/report.
 type ReportPayload struct {
-	IpAddress  string `json:"ip_address"`
-	StatusCode int    `json:"status_code"`
-	Path       string `json:"path,omitempty"`
-	Method     string `json:"method,omitempty"`
+	IpAddress      string `json:"ip_address"`
+	StatusCode     int    `json:"status_code"`
+	Path           string `json:"path,omitempty"`
+	Method         string `json:"method,omitempty"`
+	UserAgent      string `json:"user_agent,omitempty"`
+	Referer        string `json:"referer,omitempty"`
+	Fqdn           string `json:"fqdn,omitempty"`
+	Query          string `json:"query,omitempty"`
+	ContentType    string `json:"content_type,omitempty"`
+	AcceptLanguage string `json:"accept_language,omitempty"`
+	XRequestId     string `json:"x_request_id,omitempty"`
+	Protocol       string `json:"protocol,omitempty"`
 }
 
 // captureWriter wraps http.ResponseWriter to intercept the status code.
@@ -116,10 +124,18 @@ func (p *ShuulPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	ip := extractClientIP(req, p.config.ReportClientIP)
 
 	payload := ReportPayload{
-		IpAddress:  ip,
-		StatusCode: cw.statusCode,
-		Path:       req.URL.Path,
-		Method:     req.Method,
+		IpAddress:      ip,
+		StatusCode:     cw.statusCode,
+		Path:           req.URL.Path,
+		Method:         req.Method,
+		UserAgent:      req.Header.Get("User-Agent"),
+		Referer:        req.Header.Get("Referer"),
+		Fqdn:           req.Host,
+		Query:          req.URL.RawQuery,
+		ContentType:    req.Header.Get("Content-Type"),
+		AcceptLanguage: req.Header.Get("Accept-Language"),
+		XRequestId:     req.Header.Get("X-Request-Id"),
+		Protocol:       req.Header.Get("X-Forwarded-Proto"),
 	}
 
 	go p.sendReport(payload)
