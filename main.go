@@ -14,10 +14,13 @@
 package traefik_shuul_reporter
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -77,6 +80,41 @@ func (w *captureWriter) Write(b []byte) (int, error) {
 		w.WriteHeader(http.StatusOK)
 	}
 	return w.ResponseWriter.Write(b)
+}
+
+// Flush implements http.Flusher by delegating to the wrapped writer.
+// Required so SSE streams (text/event-stream) are not buffered into bursts
+// by an intermediate proxy: without this, w.(http.Flusher) fails on the
+// wrapped writer and the backend cannot flush each chunk.
+func (w *captureWriter) Flush() {
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+// Hijack implements http.Hijacker by delegating to the wrapped writer,
+// so WebSocket upgrades are not broken.
+func (w *captureWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if hijacker, ok := w.ResponseWriter.(http.Hijacker); ok {
+		return hijacker.Hijack()
+	}
+	return nil, nil, fmt.Errorf("underlying ResponseWriter does not support hijacking")
+}
+
+// Push implements http.Pusher (HTTP/2 server push) by delegating.
+func (w *captureWriter) Push(target string, opts *http.PushOptions) error {
+	if pusher, ok := w.ResponseWriter.(http.Pusher); ok {
+		return pusher.Push(target, opts)
+	}
+	return http.ErrNotSupported
+}
+
+// ReadFrom implements io.ReaderFrom for zero-copy body copies.
+func (w *captureWriter) ReadFrom(r io.Reader) (int64, error) {
+	if rf, ok := w.ResponseWriter.(io.ReaderFrom); ok {
+		return rf.ReadFrom(r)
+	}
+	return io.Copy(struct{ io.Writer }{w}, r)
 }
 
 // ShuulPlugin is the Traefik middleware plugin instance.
