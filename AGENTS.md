@@ -103,8 +103,73 @@ No tests exist. If adding tests:
 - Test `sendReport` with `httptest.NewServer`.
 - Test `ServeHTTP` with a stub backend handler.
 
+## Component: status-shim
+
+`cmd/status-shim` is a compiled Go reverse proxy (package `main`, Go 1.21,
+stdlib only — zero external deps, no new entries in `go.mod`) that sits
+between Traefik and a backend and replaces the Yaegi plugin on
+streaming/SSE routes. It is the streaming-safe, response-path capture the
+user chose over access-log parsing (fragile format, conditional headers,
+different IP, latency).
+
+- Proxy: `httputil.NewSingleHostReverseProxy` with a backend URL **without
+  path** → the original request path/query are preserved. `FlushInterval`
+  left at default.
+- Capture: `captureWriter` (same interception logic as the plugin) wraps the
+  `ResponseWriter` and, on the FIRST `WriteHeader`, enqueues a report when
+  status ≥ `-min-status` (default 300); `Write` without a header implies
+  200. **Flusher/Hijacker/Pusher/ReaderFrom delegate to the underlying
+  writer — this is compiled Go, so `w.(http.Flusher)` succeeds and the
+  reverse proxy flushes per chunk → SSE streams arrive intact, and
+  WebSocket upgrades still work.**
+- Pipeline: captureWriter → buffered channel (`-queue`, default 1000) →
+  `-workers` (default 4) goroutines POSTing with
+  `http.Client{Timeout: -timeout-ms}` (default 500ms). A full queue drops
+  reports (logged), never blocks the proxy.
+- Shutdown: SIGINT/SIGTERM → `http.Server.Shutdown` + drain the queue
+  (max 3s), exit 0.
+- Logging: stdlib `log` with prefix `status-shim:`.
+- Payload: same `reportPayload` JSON contract as the plugin (`ip_address`,
+  `status_code`, `path`, `method`, `user_agent`, `referer`, `fqdn`, `query`,
+  `content_type`, `accept_language`, `x_request_id`, `protocol`; only
+  `ip_address`/`status_code` required, rest `omitempty`). Client IP from
+  X-Forwarded-For first entry → fallback RemoteAddr without port; protocol
+  from X-Forwarded-Proto → fallback `http`.
+
+Flags fall back to env vars of the same name in upper case (`-listen` ↔
+`LISTEN` (default `:8080`), `-backend` ↔ `BACKEND` (required),
+`-shuul-url` ↔ `SHUUL_URL`, `-timeout-ms` ↔ `TIMEOUT_MS`,
+`-min-status` ↔ `MIN_STATUS`, `-workers` ↔ `WORKERS`, `-queue` ↔ `QUEUE`).
+
+Build and verify (same commands cover the whole repo, plugin included):
+
+```bash
+go build ./cmd/status-shim     # the binary; `go build .` fails (library) and that is expected
+go vet ./...
+go test ./...                  # unit + integration tests, all stdlib
+```
+
 ## Git
 
 - Binaries `shuul-reporter` and `plugin` are gitignored.
 - `v0.2.0` tag tracks the `main` branch head (force-pushable tag); keep it in sync.
 - No CI/CD workflows exist.
+
+---
+
+## CRITICAL: Yaegi never exposes http.Flusher to Traefik's compiled transport
+
+When a `*captureWriter` crosses the interpreted→compiled boundary, Yaegi
+(v0.16.1, the one Traefik v3.2 ships) adapts it to the static
+`http.ResponseWriter` type and **the compiled Traefik transport no longer sees
+it as `http.Flusher`** (verified with a local harness replicating
+`middlewareyaegi.go`). Consequence: the transport cannot flush → SSE/streaming
+responses are delivered in bursts, regardless of any `Flush()` method defined
+on the wrapper. An A/B test in production confirmed it: without the plugin the
+stream trickles, with the plugin (even with a Flush fix) it bursts.
+
+**Rule: do NOT use the Yaegi plugin on streaming/SSE routes.** For those
+routes use `cmd/status-shim` instead (see below): a compiled Go reverse
+proxy whose `captureWriter` IS seen as `http.Flusher`, so SSE streaming
+stays intact while still capturing the status code on the response path
+(the user rejected access-log parsing as an alternative).

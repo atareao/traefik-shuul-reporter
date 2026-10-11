@@ -226,6 +226,155 @@ traefik --experimental.localPlugins.shuul-reporter.modulename=./traefik-shuul-re
 
 ---
 
+
+## status-shim
+
+> **Proxy inverso Go compilado** — captura los status ≥ 300 en la ruta de la
+> respuesta y los reporta a shuul **sin romper el streaming SSE**. Es el
+> sustituto del plugin `traefik-shuul-reporter` en rutas streaming: al ser Go
+> compilado (no un plugin Yaegi interpretado), su `captureWriter` SÍ es visto
+> como `http.Flusher` por el transporte → el SSE llega por chunk.
+
+### Por qué existe
+
+El plugin Yaegi `traefik-shuul-reporter` nunca expone `http.Flusher` al
+transporte compilado de Traefik (ver AGENTS.md): el streaming SSE se entrega
+en ráfagas. El usuario descartó explícitamente el parsing del access log
+exige capturar el status **en la ruta de la
+respuesta**, como hace el plugin, sin parsing de logs y con SSE intacto.
+
+`status-shim` lo consigue siendo un **reverse proxy stdlib**
+(`net/http/httputil.ReverseProxy`) entre Traefik y el backend: su wrapper de
+`ResponseWriter` se compila con el binario, así que el transporte SÍ lo ve
+como `http.Flusher` → flushea por chunk → SSE perfecto, y a la vez captura el
+status → POST a shuul con el mismo contrato `ReportPayload` del plugin.
+
+### Qué hace
+
+- Proxy inverso al backend (`-backend=http://valet:3000`, URL **sin path** →
+  se preservan path y query del request); `FlushInterval` sin configurar.
+- `captureWriter` envuelve la ResponseWriter; en el **primer `WriteHeader`**,
+  si el status ≥ `-min-status` (300 por defecto), encola el reporte
+  inmediatamente (el status final se conoce ahí; un error a mitad de un stream
+  SSE viaja como evento con status 200, no como cambio de status). `Write`
+  sin header → 200 implícito.
+- **Flusher/Hijacker/Pusher/ReaderFrom delegan al writer subyacente** (Go
+  compilado, no Yaegi): SSE intacto y WebSockets (upgrade por `Hijack`) siguen
+  funcionando.
+- Cola con buffer `-queue` (1000) y `-workers` (4) goroutines que hacen POST
+  con `http.Client{Timeout: -timeout-ms}`; cola llena → descarta + log (nunca
+  bloquea el proxy).
+- Shutdown graceful: SIGINT/SIGTERM → `http.Server.Shutdown` + drenar la cola
+  de reportes (máx 3s), exit 0.
+- Logging: stdlib `log`, prefijo `status-shim:`.
+- Payload: mismo contrato JSON del plugin (`ip_address`, `status_code`, `path`,
+  `method`, `user_agent`, `referer`, `fqdn`, `query`, `content_type`,
+  `accept_language`, `x_request_id`, `protocol`; solo `ip_address` y
+  `status_code` obligatorios, el resto `omitempty`). IP cliente de la primera
+  entrada de `X-Forwarded-For` → fallback `RemoteAddr` sin puerto; protocol de
+  `X-Forwarded-Proto` → fallback `http`.
+
+### Flags (con fallback a env var homónima en mayúsculas)
+
+| Flag | Env | Default | Descripción |
+|---|---|---|---|
+| `-listen` | `LISTEN` | `:8080` | Dirección de escucha |
+| `-backend` | `BACKEND` | — (requerido) | URL del backend, p.ej. `http://valet:3000` |
+| `-shuul-url` | `SHUUL_URL` | `http://shuul:3000/api/v1/report` | Endpoint de reporte de shuul |
+| `-timeout-ms` | `TIMEOUT_MS` | `500` | Timeout del HTTP client de reporte (ms) |
+| `-min-status` | `MIN_STATUS` | `300` | Reporta solo status ≥ este valor |
+| `-workers` | `WORKERS` | `4` | Goroutines de POST |
+| `-queue` | `QUEUE` | `1000` | Buffer de la cola de reportes |
+
+### Wiring en Docker Compose (valet)
+
+1. **Quita el middleware del plugin del entrypoint** de Traefik: fuera
+   `--experimental.plugins.shuul-reporter.*` (y el label
+   `traefik.http.middlewares.shuul-reporter.*`). Con el plugin presente, el
+   SSE se entregaría en ráfagas.
+2. El router de valet ya no apunta directamente al backend: apunta al
+   servicio que expone el shim.
+3. El shim proxya a valet con `-backend=http://valet:3000`.
+
+```yaml
+services:
+  traefik:
+    image: traefik:v3.2
+    # command: sin --experimental.plugins.shuul-reporter.*
+    labels:
+      # El router de valet apunta al shim (que expone :8080) en lugar de al
+      # puerto del backend:
+      - "traefik.http.routers.valet.rule=Host(`valet.example.com`)"
+      - "traefik.http.routers.valet.service=status-shim"
+      - "traefik.http.services.status-shim.loadbalancer.server.port=8080"
+      # sin middlewares de plugin shuul-reporter en este router
+    networks: [app]
+
+  status-shim:
+    build:
+      context: ./
+      dockerfile: cmd/status-shim/Dockerfile
+    restart: unless-stopped
+    command:
+      - "-listen=:8080"
+      - "-backend=http://valet:3000"
+      # opcionales (defaults sensatos):
+      # - "-shuul-url=http://shuul:3000/api/v1/report"
+      # - "-min-status=300"
+      # - "-timeout-ms=500"
+      # - "-workers=4"
+      # - "-queue=1000"
+    # environment:   # cada flag admite fallback a env var homónima en mayúsculas
+    #   - LISTEN=:8080
+    #   - BACKEND=http://valet:3000
+    #   - SHUUL_URL=http://shuul:3000/api/v1/report
+    #   - WORKERS=4
+    #   - QUEUE=1000
+    depends_on:
+      - shuul
+    networks: [app]
+
+  valet:
+    # el backend real; el tráfico le llega AHORA a través del shim
+    networks: [app]
+
+  shuul:
+    image: shuul:latest
+    networks: [app]
+
+networks:
+  app:
+```
+
+> Ajusta `context:`/`dockerfile:` al layout de tu compose; el punto clave es
+> la cadena `Traefik → status-shim:8080 → valet:3000` y que el middleware del
+> plugin ya **no** esté en el router de valet.
+
+### Smoke test (streaming intacto)
+
+Con un endpoint SSE en el backend (`/events`), pásalo por el shim y mira los
+timestamps: cada chunk debe llegar **por separado** (~la cadencia del
+backend), no en ráfagas.
+
+```bash
+# 1. Levanta el stack del compose de arriba.
+
+# 2. Consume el stream a través de Traefik → status-shim, con timestamp por línea:
+curl -N -s http://valet.example.com/events | while IFS= read -r line; do
+  printf '%s  %s\n' "$(date +%H:%M:%S.%3N)" "$line"
+done
+
+# Esperado: un timestamp distinto por chunk, espaciado según el backend.
+# Si en su lugar todo llega de golpe, el plugin Yaegi sigue activo en ese router.
+```
+
+> `curl -N` (sin buffering) + timestamps por línea: si la separación entre
+> timestamps se parece a la cadencia del backend, el stream llega flusheado
+> chunk a chunk. Si quieres apuntar el curl directamente al shim (sin
+> Traefik), expón su puerto en el compose.
+
+---
+
 ## Licencia
 
 MIT
